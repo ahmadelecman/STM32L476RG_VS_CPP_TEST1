@@ -2,6 +2,15 @@ CompileFlags:
   Add:
     - '-ferror-limit=0'
     - '-Wno-implicit-int'
+    - '-Wno-missing-field-initializers'
+    - >-
+      -IC:/Users/ahsho/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/13.3.1+st.9/arm-none-eabi/include
+    - >-
+      -IC:/Users/ahsho/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/13.3.1+st.9/lib/gcc/arm-none-eabi/13.3.1/include
+    - >-
+      -IC:/Users/ahsho/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/13.3.1+st.9/include/c++/13.3.1
+    - >-
+      -IC:/Users/ahsho/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/13.3.1+st.9/include/c++/13.3.1/arm-none-eabi
   CompilationDatabase: build/Debug
 Diagnostics:
   Suppress:
@@ -9,3 +18,5 @@ Diagnostics:
     - unknown_typename
     - unknown_typename_suggest
     - typename_requires_specqual
+InlayHints:
+  Enabled: false

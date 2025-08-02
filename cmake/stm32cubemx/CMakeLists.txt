@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 # Enable CMake support for ASM, C, and CXX (C++)
-enable_language(C ASM CXX)
+enable_language(C CXX ASM)
 # STM32CubeMX generated symbols (macros)
 set(MX_Defines_Syms 
 	USE_HAL_DRIVER 
