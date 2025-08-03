@@ -21,6 +21,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Debug")
 endif()
 
+set(CMAKE_C_FLAGS_DEBUG "-O0 -g3")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3")
+
 # Set the project name
 set(CMAKE_PROJECT_NAME STM32L476RG_VS_Cpp_test1)
 
@@ -70,7 +73,13 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
+# Add sources to executable
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    Modules/Logger_UART_Interface/Logger_UART_Interface.cpp
+)
+
 # Add include paths
 target_include_directories(${PROJECT_NAME} PRIVATE
-    Module/Logger
+    Modules/Logger
+    Modules/Logger_UART_Interface
 )

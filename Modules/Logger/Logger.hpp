@@ -1,375 +1,398 @@
-/*
- * Logger.hpp
- *
- *  Created on: Aug 1, 2025
- *      Author: ahmad.shokati
- */
-
 #ifndef LOGGER_LOGGER_HPP_
 #define LOGGER_LOGGER_HPP_
 
-#pragma once
-
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
-#include <atomic>
 #include <type_traits>
-#include <string_view>
-#include <array>
 
-// =======================
-// ==== CONFIGURATION ====
-// =======================
-
-// The main buffer size. Must be a power of 2 for efficiency.
-#ifndef LOG_BUFFER_SIZE
-#define LOG_BUFFER_SIZE 1024
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((weak)) uint32_t HAL_GetTick(void);
+#ifdef __cplusplus
+}
 #endif
 
-// The maximum supported length for a logged string literal.
-#ifndef LOG_MAX_STRING_LENGTH
-#define LOG_MAX_STRING_LENGTH 127
-#endif
+#define LOGGER_MAX_PARAMETERS     6
+#define LOGGER_BUFFER_SIZE        1024  // Must be power of 2 for optimal performance
+#define LOGGER_BUFFER_MASK        (LOGGER_BUFFER_SIZE - 1)  // Bit mask for fast modulo
+#define LOGGER_MAX_PUSH_RETRIES   100
+#define LOGGER_MAX_DATA_SIZE      128    // Maximum data per single log entry
 
-// The maximum size of a single log entry (header + all arguments).
-#ifndef LOG_MAX_ENTRY_SIZE
-#define LOG_MAX_ENTRY_SIZE 64
-#endif
+// Uncomment for development debugging of oversized entries
+// #define LOGGER_DEBUG
 
-// The compile-time log level. Messages below this level are compiled out.
-#ifndef LOG_COMPILE_TIME_LEVEL
-#define LOG_COMPILE_TIME_LEVEL logger::LogLevel::Debug
-#endif
+#define LOG_PROCESS() Logger::g_logger.process()
+#define LOG_FLUSH() Logger::g_logger.flush()
+#define LOG_INIT(output) Logger::init(output)
 
-// Static checks for configuration
-static_assert((LOG_BUFFER_SIZE & (LOG_BUFFER_SIZE - 1)) == 0, "LOG_BUFFER_SIZE must be a power of 2");
-static_assert(LOG_MAX_ENTRY_SIZE < 256, "LOG_MAX_ENTRY_SIZE must be less than 256");
+// Statistics macros for easy monitoring
+#define LOG_GET_DROPPED_COUNT() Logger::g_logger.getDroppedCount()
+#define LOG_GET_TOTAL_COUNT() Logger::g_logger.getTotalCount()
+#define LOG_GET_BUFFER_USAGE() Logger::g_logger.getBufferUtilization()
+#define LOG_RESET_STATS() Logger::g_logger.resetStats()
 
-// ===============================
-// ==== Compile-time FNV-1a Hash ====
-// ===============================
+#define LOG_STATS_IF_NEEDED() do { \
+    static uint32_t last_check = 0; \
+    extern "C" __attribute__((weak)) uint32_t HAL_GetTick(void); \
+    uint32_t now = HAL_GetTick ? HAL_GetTick() : 0; \
+    if (now > last_check && (now - last_check) > 10000) { \
+        last_check = now; \
+        uint32_t dropped = LOG_GET_DROPPED_COUNT(); \
+        uint32_t total = LOG_GET_TOTAL_COUNT(); \
+        uint8_t usage = LOG_GET_BUFFER_USAGE(); \
+        if (dropped > 0) { \
+            LOG_WARN("Logger stats - Dropped: %lu/%lu, Buffer: %u%%", \
+                     dropped, total, usage); \
+        } \
+    } \
+} while(0)
 
-// Efficient single-pass constexpr FNV-1a hash for C-strings.
-constexpr uint32_t fnv1a(const char* str, uint32_t hash = 0x811c9dc5) noexcept {
-    return (*str) ? fnv1a(str + 1, (hash ^ static_cast<uint8_t>(*str)) * 0x01000193) : hash;
+constexpr uint32_t hash_string(const char* str, size_t len, uint32_t hash = 2166136261u) {
+    return len == 0 ? hash : hash_string(str + 1, len - 1, (hash ^ static_cast<uint32_t>(*str)) * 16777619u);
 }
 
-constexpr uint32_t fnv1a(std::string_view sv) noexcept {
-    uint32_t hash = 0x811c9dc5;
-    for (char c : sv) {
-        hash = (hash ^ static_cast<uint8_t>(c)) * 0x01000193;
-    }
-    return hash;
-}
+#define CONST_STRLEN(s) (sizeof(s) - 1)
 
-// =================
-// ==== Logger ====
-// =================
+#define LOG_DEBUG(format, ...) \
+    Logger::g_logger.log(Logger::LogLevel::Debug, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_INFO(format, ...) \
+    Logger::g_logger.log(Logger::LogLevel::Info, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_WARN(format, ...) \
+    Logger::g_logger.log(Logger::LogLevel::Warn, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_ERROR(format, ...) \
+    Logger::g_logger.log(Logger::LogLevel::Error, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_FATAL(format, ...) \
+    Logger::g_logger.log(Logger::LogLevel::Fatal, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
 
-namespace logger {
+namespace Logger {
 
-// LogLevel enum for compile-time filtering.
-enum class LogLevel : uint8_t {
-    None,
-    Error,
-    Warning,
-    Info,
-    Debug
-};
-
-enum class LogResult : uint8_t {
-    Success,
-    BufferFull,
-    NoCallback,
-    StringTooLong,
-    EntryTooLarge,
-    WouldBlock
-};
-
-// A thread-safe (for single-core ISRs) ring buffer implementation.
-class RingBuffer {
-private:
-    std::atomic<uint32_t> write_index_{0};
-    std::atomic<uint32_t> read_index_{0};
-    std::array<uint8_t, LOG_BUFFER_SIZE> buffer_{};
-
-    static constexpr uint32_t MASK = LOG_BUFFER_SIZE - 1;
-
+class ILogOutput {
 public:
-    // Public access to read index for advanced manipulation (like dropping messages).
-    std::atomic<uint32_t>& get_read_index() { return read_index_; }
-
-    uint32_t available_space() const noexcept {
-        uint32_t write_idx = write_index_.load(std::memory_order_relaxed);
-        uint32_t read_idx = read_index_.load(std::memory_order_acquire);
-        return LOG_BUFFER_SIZE - 1 - ((write_idx - read_idx) & MASK);
-    }
-
-    uint32_t available_data() const noexcept {
-        uint32_t write_idx = write_index_.load(std::memory_order_acquire);
-        uint32_t read_idx = read_index_.load(std::memory_order_relaxed);
-        return (write_idx - read_idx) & MASK;
-    }
-
-    bool write(const void* data, uint32_t size) noexcept {
-        if (size == 0) [[likely]] return true;
-
-        // Cache the indices to avoid multiple atomic loads
-        uint32_t write_idx = write_index_.load(std::memory_order_relaxed);
-        uint32_t read_idx = read_index_.load(std::memory_order_acquire);
-        uint32_t available = LOG_BUFFER_SIZE - 1 - ((write_idx - read_idx) & MASK);
-
-        if (size > available) [[unlikely]] return false;
-
-        const uint8_t* src = static_cast<const uint8_t*>(data);
-
-        uint32_t first_part_size = LOG_BUFFER_SIZE - write_idx;
-        if (size <= first_part_size) {
-            std::memcpy(&buffer_[write_idx], src, size);
-        } else {
-            std::memcpy(&buffer_[write_idx], src, first_part_size);
-            std::memcpy(&buffer_[0], src + first_part_size, size - first_part_size);
-        }
-
-        write_index_.store((write_idx + size) & MASK, std::memory_order_release);
-        return true;
-    }
-
-    uint32_t read(void* data, uint32_t max_size) noexcept {
-        uint32_t available = available_data();
-        if (available == 0) return 0;
-
-        uint32_t to_read = (max_size < available) ? max_size : available;
-        uint32_t read_idx = read_index_.load(std::memory_order_relaxed);
-        uint8_t* dst = static_cast<uint8_t*>(data);
-
-        uint32_t first_part_size = LOG_BUFFER_SIZE - read_idx;
-        if (to_read <= first_part_size) {
-            std::memcpy(dst, &buffer_[read_idx], to_read);
-        } else {
-            std::memcpy(dst, &buffer_[read_idx], first_part_size);
-            std::memcpy(dst + first_part_size, &buffer_[0], to_read - first_part_size);
-        }
-
-        read_index_.store((read_idx + to_read) & MASK, std::memory_order_release);
-        return to_read;
-    }
-
-    // Peek allows reading without advancing the read pointer. Needed for safe dropping.
-    uint32_t peek(void* data, uint32_t size, uint32_t offset = 0) const noexcept {
-        uint32_t available = available_data();
-        if (size + offset > available) return 0;
-
-        uint32_t read_idx = (read_index_.load(std::memory_order_relaxed) + offset) & MASK;
-        const uint8_t* src = &buffer_[read_idx];
-        uint8_t* dst = static_cast<uint8_t*>(data);
-
-        uint32_t first_part_size = LOG_BUFFER_SIZE - read_idx;
-        if (size <= first_part_size) {
-            std::memcpy(dst, src, size);
-        } else {
-            std::memcpy(dst, src, first_part_size);
-            std::memcpy(dst + first_part_size, &buffer_[0], size - first_part_size);
-        }
-        return size;
-    }
-
-    void reset() noexcept {
-        read_index_.store(0, std::memory_order_relaxed);
-        write_index_.store(0, std::memory_order_relaxed);
-    }
-
-    bool is_nearly_full(uint32_t threshold_percent = 75) const noexcept {
-        return available_space() < (LOG_BUFFER_SIZE * (100 - threshold_percent)) / 100;
-    }
+    virtual void write(const uint8_t* data, size_t length) = 0;
+    virtual ~ILogOutput() = default;
 };
 
-// Global instances
-inline RingBuffer ring_buffer;
-using FlushCallback = void(*)(const uint8_t* data, size_t size);
-inline FlushCallback flush_callback = nullptr;
+enum class LogLevel : uint8_t {
+    Debug = 0,
+    Info,
+    Warn,
+    Error,
+    Fatal
+};
 
-inline void set_flush_callback(FlushCallback cb) noexcept {
-    flush_callback = cb;
-}
+struct ParamHeader {
+    uint8_t index;
+    uint8_t type;
+    uint8_t size;
+    uint8_t _padding;
+} __attribute__((packed));
 
-// --- Serialization ---
-namespace internal {
-    template <typename T>
-    inline bool serialize_to_buffer(uint8_t* buffer, uint32_t& offset, const T& val) noexcept {
-        static_assert(std::is_trivially_copyable_v<T>, "Type must be trivially copyable");
-        if (offset + sizeof(T) > LOG_MAX_ENTRY_SIZE) [[unlikely]] return false;
-        std::memcpy(buffer + offset, &val, sizeof(T));
-        offset += sizeof(T);
-        return true;
+struct LogEntry {
+    uint16_t entry_length;
+    uint16_t _padding;
+    uint32_t timestamp;
+    uint32_t string_hash;
+    uint8_t level;
+    uint8_t num_params;
+    uint8_t reserved[2];
+    ParamHeader params[LOGGER_MAX_PARAMETERS];
+    uint8_t data[LOGGER_MAX_DATA_SIZE];
+};
+
+static constexpr size_t LOG_ENTRY_HEADER_SIZE = 16 + sizeof(ParamHeader) * LOGGER_MAX_PARAMETERS;
+static constexpr size_t LOG_ENTRY_MAX_SIZE = LOG_ENTRY_HEADER_SIZE + LOGGER_MAX_DATA_SIZE;
+
+static_assert(LOG_ENTRY_MAX_SIZE <= LOGGER_BUFFER_SIZE,
+              "LogEntry max size exceeds buffer size - reduce LOGGER_MAX_DATA_SIZE or increase LOGGER_BUFFER_SIZE");
+static_assert(LOGGER_MAX_DATA_SIZE >= 32,
+              "LOGGER_MAX_DATA_SIZE too small - should be at least 32 bytes for typical log entries");
+static_assert(LOGGER_BUFFER_SIZE >= 256,
+              "LOGGER_BUFFER_SIZE too small - should be at least 256 bytes for reasonable buffering");
+static_assert((LOGGER_BUFFER_SIZE & (LOGGER_BUFFER_SIZE - 1)) == 0,
+              "LOGGER_BUFFER_SIZE must be power of 2 for optimal performance");
+
+struct SerializedLogEntry {
+    uint16_t entry_length;
+    uint16_t _padding;
+    uint32_t timestamp;
+    uint32_t string_hash;
+    uint8_t level;
+    uint8_t num_params;
+    uint8_t reserved[2];
+} __attribute__((packed));
+
+class LogManager {
+public:
+    explicit LogManager(ILogOutput* output)
+        : head_(0), tail_(0), logging_enabled_(true),
+          dropped_entries_(0), total_entries_(0), output_(output) {}
+
+    void enable(bool enabled) {
+        logging_enabled_.store(enabled, std::memory_order_release);
     }
 
-    inline bool serialize_to_buffer(uint8_t* buffer, uint32_t& offset, const char* str) noexcept {
-        if (!str) [[unlikely]] {
-            return serialize_to_buffer(buffer, offset, uint8_t{0});
+    uint32_t getDroppedCount() const {
+        return dropped_entries_.load(std::memory_order_acquire);
+    }
+
+    uint32_t getTotalCount() const {
+        return total_entries_.load(std::memory_order_acquire);
+    }
+
+    void resetStats() {
+        dropped_entries_.store(0, std::memory_order_release);
+        total_entries_.store(0, std::memory_order_release);
+    }
+
+    uint8_t getBufferUtilization() const {
+        size_t current_head = head_.load(std::memory_order_acquire);
+        size_t current_tail = tail_.load(std::memory_order_acquire);
+        size_t used = current_head - current_tail;
+        return static_cast<uint8_t>((used * 100) / LOGGER_BUFFER_SIZE);
+    }
+
+    void setOutput(ILogOutput* output) {
+        output_ = output;
+    }
+
+    static void init(ILogOutput* output) {
+        g_logger.setOutput(output);
+    }
+
+    void flush() {
+        process();
+    }
+
+    template <typename... Args>
+    void log(LogLevel level, uint32_t string_hash, Args&&... args) {
+        if (!logging_enabled_.load(std::memory_order_acquire)) return;
+        total_entries_.fetch_add(1, std::memory_order_relaxed);
+
+        constexpr size_t num_args = sizeof...(args);
+        if constexpr (num_args > LOGGER_MAX_PARAMETERS) {
+            dropped_entries_.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
 
-        // Fast path for short strings (avoid strlen)
-        const char* end = str;
-        uint8_t len = 0;
-        while (*end && len < LOG_MAX_STRING_LENGTH) {
-            ++end;
-            ++len;
+        size_t headers_size = num_args * sizeof(ParamHeader);
+        alignas(4) uint8_t temp_buffer[sizeof(ParamHeader) * LOGGER_MAX_PARAMETERS + 128];
+        ParamHeader* headers = reinterpret_cast<ParamHeader*>(temp_buffer);
+        uint8_t* data_start = temp_buffer + headers_size;
+        uint8_t* data_ptr = data_start;
+        size_t param_index = 0;
+
+        if constexpr (num_args > 0) {
+            packParams(headers, data_ptr, param_index, std::forward<Args>(args)...);
         }
 
-        if (len > LOG_MAX_STRING_LENGTH) [[unlikely]] return false;
-        if (offset + sizeof(len) + len > LOG_MAX_ENTRY_SIZE) [[unlikely]] return false;
+        size_t data_size = static_cast<size_t>(data_ptr - data_start);
+        size_t total_entry_size = LOG_ENTRY_HEADER_SIZE + data_size;
 
-        serialize_to_buffer(buffer, offset, len);
-        std::memcpy(buffer + offset, str, len);
-        offset += len;
-        return true;
-    }
-
-    inline bool serialize_to_buffer(uint8_t* buffer, uint32_t& offset, std::string_view sv) noexcept {
-        if (sv.size() > LOG_MAX_STRING_LENGTH) [[unlikely]] return false;
-        uint8_t len_u8 = static_cast<uint8_t>(sv.size());
-        if (offset + sizeof(len_u8) + sv.size() > LOG_MAX_ENTRY_SIZE) [[unlikely]] return false;
-
-        serialize_to_buffer(buffer, offset, len_u8);
-        std::memcpy(buffer + offset, sv.data(), sv.size());
-        offset += sv.size();
-        return true;
-    }
-
-    // Using C++17 fold expression for more concise variadic serialization.
-    template<typename... Ts>
-    inline bool serialize_all_to_buffer(uint8_t* buffer, uint32_t& offset, const Ts&... args) noexcept {
-        return (serialize_to_buffer(buffer, offset, args) && ...);
-    }
-
-    // Internal implementation of emit. Serializes to a self-contained packet.
-    template<uint32_t MsgId, typename... Args>
-    inline LogResult emit_internal(Args&&... args) noexcept {
-        uint8_t temp_buffer[LOG_MAX_ENTRY_SIZE];
-        uint32_t offset = 0;
-
-        // Reserve space for total length, to be written later.
-        offset += sizeof(uint8_t);
-
-        // Serialize message ID and all arguments.
-        if (!serialize_all_to_buffer(temp_buffer, offset, MsgId, std::forward<Args>(args)...)) {
-            return LogResult::EntryTooLarge;
+        if (total_entry_size > LOG_ENTRY_MAX_SIZE || total_entry_size > LOGGER_BUFFER_SIZE) {
+            dropped_entries_.fetch_add(1, std::memory_order_relaxed);
+#ifdef LOGGER_DEBUG
+            // Debug hook for oversized entries
+#endif
+            return;
         }
 
-        // Go back and write the total length at the beginning of the buffer.
-        uint8_t total_length = static_cast<uint8_t>(offset);
-        std::memcpy(temp_buffer, &total_length, sizeof(total_length));
+        for (int retry = 0; retry < LOGGER_MAX_PUSH_RETRIES; ++retry) {
+            size_t current_head = head_.load(std::memory_order_acquire);
+            size_t current_tail = tail_.load(std::memory_order_acquire);
+            size_t used = current_head - current_tail;
 
-        // Write the complete, self-contained packet to the ring buffer.
-        if (ring_buffer.write(temp_buffer, total_length)) {
-            return LogResult::Success;
+            if ((used + total_entry_size) > LOGGER_BUFFER_SIZE) {
+                dropped_entries_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            size_t new_head = current_head + total_entry_size;
+
+            if (head_.compare_exchange_weak(current_head, new_head, std::memory_order_acq_rel)) {
+                writeEntry(current_head, level, string_hash, static_cast<uint16_t>(total_entry_size),
+                           headers, data_start, param_index, data_size);
+                return;
+            }
+        }
+
+        dropped_entries_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    size_t serializeEntry(const uint8_t* entry_data, uint8_t* output_buffer, size_t max_size) {
+        const LogEntry* entry = reinterpret_cast<const LogEntry*>(entry_data);
+
+        if (sizeof(SerializedLogEntry) > max_size) return 0;
+
+        SerializedLogEntry* serialized = reinterpret_cast<SerializedLogEntry*>(output_buffer);
+        serialized->entry_length = entry->entry_length;
+        serialized->_padding = entry->_padding;
+        serialized->timestamp = entry->timestamp;
+        serialized->string_hash = entry->string_hash;
+        serialized->level = entry->level;
+        serialized->num_params = entry->num_params;
+        serialized->reserved[0] = entry->reserved[0];
+        serialized->reserved[1] = entry->reserved[1];
+
+        size_t offset = sizeof(SerializedLogEntry);
+
+        for (uint8_t i = 0; i < entry->num_params && i < LOGGER_MAX_PARAMETERS; ++i) {
+            if (offset + sizeof(ParamHeader) > max_size) return 0;
+            std::memcpy(output_buffer + offset, &entry->params[i], sizeof(ParamHeader));
+            offset += sizeof(ParamHeader);
+        }
+
+        size_t headers_size = entry->num_params * sizeof(ParamHeader);
+        size_t data_size = entry->entry_length - sizeof(SerializedLogEntry) - headers_size;
+        if (offset + data_size > max_size) return 0;
+
+        std::memcpy(output_buffer + offset, entry->data, data_size);
+        offset += data_size;
+
+        return offset;
+    }
+
+    void process() {
+        alignas(32) uint8_t dma_buffer[512];
+
+        while (true) {
+            size_t current_tail = tail_.load(std::memory_order_acquire);
+            size_t current_head = head_.load(std::memory_order_acquire);
+
+            if (current_tail >= current_head) break;
+
+            size_t read_pos = current_tail & LOGGER_BUFFER_MASK;
+            uint16_t entry_length;
+
+            if (read_pos + sizeof(uint16_t) <= LOGGER_BUFFER_SIZE) {
+                std::memcpy(&entry_length, &buffer_[read_pos], sizeof(uint16_t));
+            } else {
+                size_t first_part = LOGGER_BUFFER_SIZE - read_pos;
+                std::memcpy(&entry_length, &buffer_[read_pos], first_part);
+                std::memcpy(reinterpret_cast<uint8_t*>(&entry_length) + first_part,
+                            &buffer_[0], sizeof(uint16_t) - first_part);
+            }
+
+            if (entry_length == 0 || entry_length > LOGGER_BUFFER_SIZE) {
+                tail_.store(current_head, std::memory_order_release);
+                break;
+            }
+
+            alignas(4) uint8_t entry_buffer[512];
+            readFromCircularBuffer(current_tail, entry_buffer, entry_length);
+
+            size_t serialized_size = serializeEntry(entry_buffer, dma_buffer, sizeof(dma_buffer));
+            if (output_ && serialized_size > 0) {
+                output_->write(dma_buffer, serialized_size);
+            }
+
+            size_t expected_tail = current_tail;
+            if (!tail_.compare_exchange_weak(expected_tail, current_tail + entry_length,
+                                             std::memory_order_acq_rel)) {
+                continue;
+            }
+        }
+    }
+
+    static LogManager g_logger;
+
+private:
+    void writeEntry(size_t write_pos, LogLevel level, uint32_t string_hash,
+                    uint16_t entry_length, ParamHeader* headers, uint8_t* data_start,
+                    size_t num_params, size_t data_size) {
+        LogEntry entry;
+        entry.entry_length = entry_length;
+        entry._padding = 0;
+        entry.timestamp = getTimestamp();
+        entry.string_hash = string_hash;
+        entry.level = static_cast<uint8_t>(level);
+        entry.num_params = static_cast<uint8_t>(num_params);
+        entry.reserved[0] = 0;
+        entry.reserved[1] = 0;
+
+        if (num_params > 0) {
+            std::memcpy(entry.params, headers, num_params * sizeof(ParamHeader));
+            std::memcpy(entry.data, data_start, data_size);
+        }
+
+        writeToCircularBuffer(write_pos, reinterpret_cast<uint8_t*>(&entry), entry_length);
+    }
+
+    void writeToCircularBuffer(size_t pos, const uint8_t* data, size_t length) {
+        size_t write_pos = pos & LOGGER_BUFFER_MASK;
+
+        if (write_pos + length <= LOGGER_BUFFER_SIZE) {
+            std::memcpy(&buffer_[write_pos], data, length);
         } else {
-            return LogResult::BufferFull;
+            size_t first_part = LOGGER_BUFFER_SIZE - write_pos;
+            std::memcpy(&buffer_[write_pos], data, first_part);
+            std::memcpy(&buffer_[0], data + first_part, length - first_part);
         }
     }
-} // namespace internal
 
-// --- Public API ---
+    void readFromCircularBuffer(size_t pos, uint8_t* data, size_t length) {
+        size_t read_pos = pos & LOGGER_BUFFER_MASK;
 
-// Main entry point for macros, performs compile-time level checking.
-template<logger::LogLevel Level, uint32_t MsgId, typename... Args>
-inline LogResult emit_level(Args&&... args) noexcept {
-    if constexpr (Level <= LOG_COMPILE_TIME_LEVEL && Level != logger::LogLevel::None) {
-        return internal::emit_internal<MsgId>(std::forward<Args>(args)...);
-    } else {
-        return LogResult::Success; // Do nothing, message is compiled out.
-    }
-}
-
-inline LogResult flush() noexcept {
-    if (!flush_callback) return LogResult::NoCallback;
-
-    uint8_t temp_buffer[128]; // Read in chunks
-    uint32_t bytes_read;
-
-    while ((bytes_read = ring_buffer.read(temp_buffer, sizeof(temp_buffer))) > 0) {
-        flush_callback(temp_buffer, bytes_read);
-    }
-
-    return LogResult::Success;
-}
-
-// Drops the oldest message by reading its length prefix. Much safer.
-inline bool drop_oldest_message() noexcept {
-    uint8_t length_prefix = 0;
-    if (ring_buffer.peek(&length_prefix, sizeof(length_prefix)) == sizeof(length_prefix)) [[likely]] {
-        if (length_prefix > 0 && length_prefix <= LOG_MAX_ENTRY_SIZE) [[likely]] {
-            // Atomically advance the read pointer by the message length.
-            uint32_t current_read = ring_buffer.get_read_index().load(std::memory_order_relaxed);
-            uint32_t next_read = (current_read + length_prefix) & (LOG_BUFFER_SIZE - 1);
-            ring_buffer.get_read_index().store(next_read, std::memory_order_release);
-            return true;
+        if (read_pos + length <= LOGGER_BUFFER_SIZE) {
+            std::memcpy(data, &buffer_[read_pos], length);
+        } else {
+            size_t first_part = LOGGER_BUFFER_SIZE - read_pos;
+            std::memcpy(data, &buffer_[read_pos], first_part);
+            std::memcpy(data + first_part, &buffer_[0], length - first_part);
         }
     }
-    return false; // Buffer was empty or contained invalid data
-}
 
-inline uint32_t get_buffer_usage() noexcept {
-    return ring_buffer.available_data();
-}
+    template <typename T, typename... Rest>
+    void packParams(ParamHeader* headers, uint8_t*& data_ptr, size_t& index, T&& arg, Rest&&... rest) {
+        static_assert(std::is_trivially_copyable_v<std::decay_t<T>>,
+                      "Only trivially copyable types are supported");
 
-inline uint32_t get_buffer_free_space() noexcept {
-    return ring_buffer.available_space();
-}
+        using U = std::decay_t<T>;
 
-inline bool is_buffer_nearly_full(uint32_t threshold_percent = 75) noexcept {
-    return ring_buffer.is_nearly_full(threshold_percent);
-}
+        headers[index].index = static_cast<uint8_t>(index);
+        headers[index].type = typeToCode<U>();
+        headers[index].size = sizeof(U);
+        headers[index]._padding = 0;
 
-inline void reset() noexcept {
-    ring_buffer.reset();
-}
+        std::memcpy(data_ptr, &arg, sizeof(U));
+        data_ptr += sizeof(U);
+        ++index;
 
-inline LogResult try_auto_flush(uint32_t threshold_percent = 75) noexcept {
-    if (is_buffer_nearly_full(threshold_percent)) {
-        return flush();
+        if constexpr (sizeof...(rest) > 0) {
+            packParams(headers, data_ptr, index, std::forward<Rest>(rest)...);
+        }
     }
-    return LogResult::Success;
-}
 
-} // namespace logger
+    template <typename T>
+    constexpr uint8_t typeToCode() const {
+        using U = std::decay_t<T>;
+        if constexpr (std::is_same_v<U, int32_t>) return 1;
+        else if constexpr (std::is_same_v<U, uint32_t>) return 2;
+        else if constexpr (std::is_same_v<U, float>) return 3;
+        else if constexpr (std::is_same_v<U, int16_t>) return 4;
+        else if constexpr (std::is_same_v<U, uint16_t>) return 5;
+        else if constexpr (std::is_same_v<U, int8_t>) return 6;
+        else if constexpr (std::is_same_v<U, uint8_t>) return 7;
+        else static_assert(sizeof(U) == 0, "Unsupported type.");
+    }
 
-// ==================================
-// ==== User Log Macros ====
-// ==================================
+    inline uint32_t getTimestamp() const {
+        return HAL_GetTick ? HAL_GetTick() : 0;
+    }
 
-#define LOG_ERROR(msg, ...)   logger::emit_level<logger::LogLevel::Error,   fnv1a(msg)>(__VA_ARGS__)
-#define LOG_WARN(msg, ...)    logger::emit_level<logger::LogLevel::Warning, fnv1a(msg)>(__VA_ARGS__)
-#define LOG_INFO(msg, ...)    logger::emit_level<logger::LogLevel::Info,    fnv1a(msg)>(__VA_ARGS__)
-#define LOG_DEBUG(msg, ...)   logger::emit_level<logger::LogLevel::Debug,   fnv1a(msg)>(__VA_ARGS__)
+    alignas(32) uint8_t buffer_[LOGGER_BUFFER_SIZE];
+    std::atomic<size_t> head_;
+    std::atomic<size_t> tail_;
+    std::atomic<bool> logging_enabled_;
+    std::atomic<uint32_t> dropped_entries_;
+    std::atomic<uint32_t> total_entries_;
+    ILogOutput* output_;
+};
 
-// Composite policy macros
-#define LOG_ERROR_EMERGENCY(msg, ...) \
-    do { \
-        if (LOG_ERROR(msg, __VA_ARGS__) == logger::LogResult::BufferFull) { \
-            logger::drop_oldest_message(); \
-            LOG_ERROR(msg, __VA_ARGS__); \
-        } \
-    } while(0)
+inline LogManager g_logger(nullptr);
 
-#define LOG_SAFE(level, msg, ...) \
-    do { \
-        auto result = LOG_##level(msg, __VA_ARGS__); \
-        if (result == logger::LogResult::BufferFull) { \
-            logger::try_auto_flush(); \
-        } \
-    } while(0)
-
-#define LOG_NONBLOCK(level, msg, ...) \
-    do { \
-        if (!logger::is_buffer_nearly_full(90)) { \
-            LOG_##level(msg, __VA_ARGS__); \
-        } \
-    } while(0)
-
-
+} // namespace Logger
 
 #endif /* LOGGER_LOGGER_HPP_ */
-

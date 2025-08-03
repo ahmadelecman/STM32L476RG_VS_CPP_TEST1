@@ -21,6 +21,7 @@
 #include "stm32l4xx_hal_gpio.h"
 #include "stm32l4xx_hal_uart.h"
 #include <string.h>
+#include "Logger.hpp"
 
 
 /* Private includes ----------------------------------------------------------*/
@@ -62,7 +63,8 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-  uint8_t counter = 0;
+
+
 /* USER CODE END 0 */
 
 /**
@@ -97,6 +99,8 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -104,20 +108,9 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    counter++;
-    if(counter == 10)
-    {
-      counter = 0;
-      // Send a message over UART every 100 iterations
-      const char *msg = "Hello from STM32!\r\n";
 
-      HAL_UART_Transmit_DMA(&huart2, (uint8_t *)msg, strlen(msg));
-
-      __HAL_DMA_DISABLE_IT(&hdma_usart2_tx, DMA_IT_HT);
-    }
     /* USER CODE BEGIN 3 */
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-
     HAL_Delay(500); // Toggle LED every 500 ms
   }
   /* USER CODE END 3 */
