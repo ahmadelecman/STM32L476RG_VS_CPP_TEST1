@@ -28,7 +28,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3")
 set(CMAKE_PROJECT_NAME STM32L476RG_VS_Cpp_test1)
 
 # Enable compile command to ease indexing with e.g. clangd
-set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Core project settings
 project(${CMAKE_PROJECT_NAME})
@@ -42,6 +42,22 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
+
+# Add system include paths as compile flags (after add_executable and add_subdirectory)
+if(DEFINED ENV{CUBE_BUNDLE_PATH})
+    set(TOOLCHAIN_PATH "$ENV{CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/13.3.1+st.9")
+    
+    # Add as compile options instead of include directories
+    target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+        "-I${TOOLCHAIN_PATH}/arm-none-eabi/include"
+        "-I${TOOLCHAIN_PATH}/lib/gcc/arm-none-eabi/13.3.1/include"
+        "-I${TOOLCHAIN_PATH}/arm-none-eabi/include/c++/13.3.1"
+        "-I${TOOLCHAIN_PATH}/arm-none-eabi/include/c++/13.3.1/arm-none-eabi"
+    )
+    message(STATUS "Added system includes as compile flags from: ${TOOLCHAIN_PATH}")
+else()
+    message(WARNING "CUBE_BUNDLE_PATH environment variable not set.")
+endif()
 
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
