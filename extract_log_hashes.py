@@ -19,23 +19,33 @@ hashes = {}
 source_dirs = sys.argv[1:-1]
 output_file = sys.argv[-1]
 
-print("Scanning source directories:", source_dirs)
+print("Current working directory:", os.getcwd())
+print("Source dirs:", source_dirs)
+print("Contents of current directory:", os.listdir('.'))
+
 for src_dir in source_dirs:
+    print(f"\nListing files in {src_dir}:")
     for root, dirs, files in os.walk(src_dir):
+        print("  In folder:", root)
         for file in files:
+            print("    File:", file)
             if file.endswith(('.c', '.cpp', '.h', '.hpp')):
                 file_path = os.path.join(root, file)
-                print("Scanning:", file_path)
                 with open(file_path, encoding='utf-8', errors='ignore') as f:
                     for line in f:
+                        if "LOG_INFO" in line:
+                            print("Line with LOG_INFO:", line.strip())
+                            if log_macro.search(line):
+                                print("  Regex matched!")
+                            else:
+                                print("  Regex did NOT match!")
                         for match in log_macro.finditer(line):
                             fmt = match.group(2)
                             h = hash_string(fmt)
                             print(f"  Found log string: \"{fmt}\" (hash: 0x{h:08X})")
                             hashes[f"{h:08X}"] = fmt
 
-print(f"Writing {len(hashes)} log strings to {output_file}")
+print(f"\nWriting {len(hashes)} log strings to {output_file}")
 with open(output_file, 'w', encoding='utf-8') as out:
     json.dump(hashes, out, indent=4, ensure_ascii=False)
 
-    
