@@ -24,49 +24,6 @@ __attribute__((weak)) uint32_t HAL_GetTick(void);
 // Uncomment for development debugging of oversized entries
 // #define LOGGER_DEBUG
 
-#define LOG_PROCESS() Logger::g_logger.process()
-#define LOG_FLUSH() Logger::g_logger.flush()
-#define LOG_INIT(output) Logger::init(output)
-
-// Statistics macros for easy monitoring
-#define LOG_GET_DROPPED_COUNT() Logger::g_logger.getDroppedCount()
-#define LOG_GET_TOTAL_COUNT() Logger::g_logger.getTotalCount()
-#define LOG_GET_BUFFER_USAGE() Logger::g_logger.getBufferUtilization()
-#define LOG_RESET_STATS() Logger::g_logger.resetStats()
-
-#define LOG_STATS_IF_NEEDED() do { \
-    static uint32_t last_check = 0; \
-    extern "C" __attribute__((weak)) uint32_t HAL_GetTick(void); \
-    uint32_t now = HAL_GetTick ? HAL_GetTick() : 0; \
-    if (now > last_check && (now - last_check) > 10000) { \
-        last_check = now; \
-        uint32_t dropped = LOG_GET_DROPPED_COUNT(); \
-        uint32_t total = LOG_GET_TOTAL_COUNT(); \
-        uint8_t usage = LOG_GET_BUFFER_USAGE(); \
-        if (dropped > 0) { \
-            LOG_WARN("Logger stats - Dropped: %lu/%lu, Buffer: %u%%", \
-                     dropped, total, usage); \
-        } \
-    } \
-} while(0)
-
-constexpr uint32_t hash_string(const char* str, size_t len, uint32_t hash = 2166136261u) {
-    return len == 0 ? hash : hash_string(str + 1, len - 1, (hash ^ static_cast<uint32_t>(*str)) * 16777619u);
-}
-
-#define CONST_STRLEN(s) (sizeof(s) - 1)
-
-#define LOG_DEBUG(format, ...) \
-    Logger::g_logger.log(Logger::LogLevel::Debug, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
-#define LOG_INFO(format, ...) \
-    Logger::g_logger.log(Logger::LogLevel::Info, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
-#define LOG_WARN(format, ...) \
-    Logger::g_logger.log(Logger::LogLevel::Warn, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
-#define LOG_ERROR(format, ...) \
-    Logger::g_logger.log(Logger::LogLevel::Error, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
-#define LOG_FATAL(format, ...) \
-    Logger::g_logger.log(Logger::LogLevel::Fatal, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
-
 namespace Logger {
 
 class ILogOutput {
@@ -90,6 +47,7 @@ struct ParamHeader {
     uint8_t _padding;
 } __attribute__((packed));
 
+// Only used for in-memory buffer, not for serialization
 struct LogEntry {
     uint16_t entry_length;
     uint16_t _padding;
@@ -102,18 +60,7 @@ struct LogEntry {
     uint8_t data[LOGGER_MAX_DATA_SIZE];
 };
 
-static constexpr size_t LOG_ENTRY_HEADER_SIZE = 16 + sizeof(ParamHeader) * LOGGER_MAX_PARAMETERS;
-static constexpr size_t LOG_ENTRY_MAX_SIZE = LOG_ENTRY_HEADER_SIZE + LOGGER_MAX_DATA_SIZE;
-
-static_assert(LOG_ENTRY_MAX_SIZE <= LOGGER_BUFFER_SIZE,
-              "LogEntry max size exceeds buffer size - reduce LOGGER_MAX_DATA_SIZE or increase LOGGER_BUFFER_SIZE");
-static_assert(LOGGER_MAX_DATA_SIZE >= 32,
-              "LOGGER_MAX_DATA_SIZE too small - should be at least 32 bytes for typical log entries");
-static_assert(LOGGER_BUFFER_SIZE >= 256,
-              "LOGGER_BUFFER_SIZE too small - should be at least 256 bytes for reasonable buffering");
-static_assert((LOGGER_BUFFER_SIZE & (LOGGER_BUFFER_SIZE - 1)) == 0,
-              "LOGGER_BUFFER_SIZE must be power of 2 for optimal performance");
-
+// For serialization and parsing
 struct SerializedLogEntry {
     uint16_t entry_length;
     uint16_t _padding;
@@ -123,6 +70,18 @@ struct SerializedLogEntry {
     uint8_t num_params;
     uint8_t reserved[2];
 } __attribute__((packed));
+
+static constexpr size_t LOG_ENTRY_HEADER_BASE_SIZE = 16; // header without params
+static constexpr size_t LOG_ENTRY_MAX_SIZE = LOG_ENTRY_HEADER_BASE_SIZE + sizeof(ParamHeader) * LOGGER_MAX_PARAMETERS + LOGGER_MAX_DATA_SIZE;
+
+static_assert(LOG_ENTRY_MAX_SIZE <= LOGGER_BUFFER_SIZE,
+              "LogEntry max size exceeds buffer size - reduce LOGGER_MAX_DATA_SIZE or increase LOGGER_BUFFER_SIZE");
+static_assert(LOGGER_MAX_DATA_SIZE >= 32,
+              "LOGGER_MAX_DATA_SIZE too small - should be at least 32 bytes for typical log entries");
+static_assert(LOGGER_BUFFER_SIZE >= 256,
+              "LOGGER_BUFFER_SIZE too small - should be at least 256 bytes for reasonable buffering");
+static_assert((LOGGER_BUFFER_SIZE & (LOGGER_BUFFER_SIZE - 1)) == 0,
+              "LOGGER_BUFFER_SIZE must be power of 2 for optimal performance");
 
 class LogManager {
 public:
@@ -158,10 +117,6 @@ public:
         output_ = output;
     }
 
-    static void init(ILogOutput* output) {
-        g_logger.setOutput(output);
-    }
-
     void flush() {
         process();
     }
@@ -189,7 +144,7 @@ public:
         }
 
         size_t data_size = static_cast<size_t>(data_ptr - data_start);
-        size_t total_entry_size = LOG_ENTRY_HEADER_SIZE + data_size;
+        size_t total_entry_size = LOG_ENTRY_HEADER_BASE_SIZE + headers_size + data_size;
 
         if (total_entry_size > LOG_ENTRY_MAX_SIZE || total_entry_size > LOGGER_BUFFER_SIZE) {
             dropped_entries_.fetch_add(1, std::memory_order_relaxed);
@@ -222,33 +177,24 @@ public:
     }
 
     size_t serializeEntry(const uint8_t* entry_data, uint8_t* output_buffer, size_t max_size) {
-        const LogEntry* entry = reinterpret_cast<const LogEntry*>(entry_data);
+        const SerializedLogEntry* entry = reinterpret_cast<const SerializedLogEntry*>(entry_data);
 
         if (sizeof(SerializedLogEntry) > max_size) return 0;
 
-        SerializedLogEntry* serialized = reinterpret_cast<SerializedLogEntry*>(output_buffer);
-        serialized->entry_length = entry->entry_length;
-        serialized->_padding = entry->_padding;
-        serialized->timestamp = entry->timestamp;
-        serialized->string_hash = entry->string_hash;
-        serialized->level = entry->level;
-        serialized->num_params = entry->num_params;
-        serialized->reserved[0] = entry->reserved[0];
-        serialized->reserved[1] = entry->reserved[1];
-
+        // Copy header
+        std::memcpy(output_buffer, entry_data, sizeof(SerializedLogEntry));
         size_t offset = sizeof(SerializedLogEntry);
 
-        for (uint8_t i = 0; i < entry->num_params && i < LOGGER_MAX_PARAMETERS; ++i) {
-            if (offset + sizeof(ParamHeader) > max_size) return 0;
-            std::memcpy(output_buffer + offset, &entry->params[i], sizeof(ParamHeader));
-            offset += sizeof(ParamHeader);
-        }
+        // Copy param headers
+        uint8_t num_params = entry->num_params;
+        if (offset + num_params * sizeof(ParamHeader) > max_size) return 0;
+        std::memcpy(output_buffer + offset, entry_data + offset, num_params * sizeof(ParamHeader));
+        offset += num_params * sizeof(ParamHeader);
 
-        size_t headers_size = entry->num_params * sizeof(ParamHeader);
-        size_t data_size = entry->entry_length - sizeof(SerializedLogEntry) - headers_size;
+        // Copy data
+        size_t data_size = entry->entry_length - sizeof(SerializedLogEntry) - num_params * sizeof(ParamHeader);
         if (offset + data_size > max_size) return 0;
-
-        std::memcpy(output_buffer + offset, entry->data, data_size);
+        std::memcpy(output_buffer + offset, entry_data + offset, data_size);
         offset += data_size;
 
         return offset;
@@ -280,7 +226,7 @@ public:
                 break;
             }
 
-            alignas(4) uint8_t entry_buffer[512];
+            alignas(4) uint8_t entry_buffer[LOG_ENTRY_MAX_SIZE];
             readFromCircularBuffer(current_tail, entry_buffer, entry_length);
 
             size_t serialized_size = serializeEntry(entry_buffer, dma_buffer, sizeof(dma_buffer));
@@ -296,28 +242,42 @@ public:
         }
     }
 
-    static LogManager g_logger;
-
 private:
     void writeEntry(size_t write_pos, LogLevel level, uint32_t string_hash,
                     uint16_t entry_length, ParamHeader* headers, uint8_t* data_start,
                     size_t num_params, size_t data_size) {
-        LogEntry entry;
-        entry.entry_length = entry_length;
-        entry._padding = 0;
-        entry.timestamp = getTimestamp();
-        entry.string_hash = string_hash;
-        entry.level = static_cast<uint8_t>(level);
-        entry.num_params = static_cast<uint8_t>(num_params);
-        entry.reserved[0] = 0;
-        entry.reserved[1] = 0;
+        // Use a temporary buffer to assemble the entry
+        alignas(4) uint8_t entry_buffer[LOG_ENTRY_MAX_SIZE];
+        size_t offset = 0;
 
+        // Write header
+        SerializedLogEntry header;
+        header.entry_length = entry_length;
+        header._padding = 0;
+        header.timestamp = getTimestamp();
+        header.string_hash = string_hash;
+        header.level = static_cast<uint8_t>(level);
+        header.num_params = static_cast<uint8_t>(num_params);
+        header.reserved[0] = 0;
+        header.reserved[1] = 0;
+
+        std::memcpy(entry_buffer + offset, &header, sizeof(header));
+        offset += sizeof(header);
+
+        // Write only used ParamHeaders
         if (num_params > 0) {
-            std::memcpy(entry.params, headers, num_params * sizeof(ParamHeader));
-            std::memcpy(entry.data, data_start, data_size);
+            std::memcpy(entry_buffer + offset, headers, num_params * sizeof(ParamHeader));
+            offset += num_params * sizeof(ParamHeader);
         }
 
-        writeToCircularBuffer(write_pos, reinterpret_cast<uint8_t*>(&entry), entry_length);
+        // Write only used data
+        if (data_size > 0) {
+            std::memcpy(entry_buffer + offset, data_start, data_size);
+            offset += data_size;
+        }
+
+        // Write to circular buffer
+        writeToCircularBuffer(write_pos, entry_buffer, entry_length);
     }
 
     void writeToCircularBuffer(size_t pos, const uint8_t* data, size_t length) {
@@ -391,8 +351,55 @@ private:
     ILogOutput* output_;
 };
 
-inline LogManager g_logger(nullptr);
-
 } // namespace Logger
+
+// Hash function for string literals
+constexpr uint32_t hash_string(const char* str, size_t len, uint32_t hash = 2166136261u) {
+    return len == 0 ? hash : hash_string(str + 1, len - 1, (hash ^ static_cast<uint32_t>(*str)) * 16777619u);
+}
+
+#define CONST_STRLEN(s) (sizeof(s) - 1)
+
+// Global logger instance - declared before macros!
+inline Logger::LogManager g_logger(nullptr);
+
+// Logger macros - defined after g_logger is declared
+#define LOG_PROCESS() g_logger.process()
+#define LOG_FLUSH() g_logger.flush()
+#define LOG_INIT(output) g_logger.setOutput(output)
+
+// Statistics macros for easy monitoring
+#define LOG_GET_DROPPED_COUNT() g_logger.getDroppedCount()
+#define LOG_GET_TOTAL_COUNT() g_logger.getTotalCount()
+#define LOG_GET_BUFFER_USAGE() g_logger.getBufferUtilization()
+#define LOG_RESET_STATS() g_logger.resetStats()
+
+#define LOG_STATS_IF_NEEDED() do { \
+    static uint32_t last_check = 0; \
+    extern "C" __attribute__((weak)) uint32_t HAL_GetTick(void); \
+    uint32_t now = HAL_GetTick ? HAL_GetTick() : 0; \
+    if (now > last_check && (now - last_check) > 10000) { \
+        last_check = now; \
+        uint32_t dropped = LOG_GET_DROPPED_COUNT(); \
+        uint32_t total = LOG_GET_TOTAL_COUNT(); \
+        uint8_t usage = LOG_GET_BUFFER_USAGE(); \
+        if (dropped > 0) { \
+            LOG_WARN("Logger stats - Dropped: %lu/%lu, Buffer: %u%%", \
+                     dropped, total, usage); \
+        } \
+    } \
+} while(0)
+
+// Logging macros
+#define LOG_DEBUG(format, ...) \
+    g_logger.log(Logger::LogLevel::Debug, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_INFO(format, ...) \
+    g_logger.log(Logger::LogLevel::Info, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_WARN(format, ...) \
+    g_logger.log(Logger::LogLevel::Warn, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_ERROR(format, ...) \
+    g_logger.log(Logger::LogLevel::Error, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
+#define LOG_FATAL(format, ...) \
+    g_logger.log(Logger::LogLevel::Fatal, hash_string(format, CONST_STRLEN(format)), ##__VA_ARGS__)
 
 #endif /* LOGGER_LOGGER_HPP_ */

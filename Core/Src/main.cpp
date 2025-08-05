@@ -22,7 +22,7 @@
 #include "stm32l4xx_hal_uart.h"
 #include <string.h>
 #include "Logger.hpp"
-
+#include "Logger_UART_Interface.hpp"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -57,13 +57,13 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 
 /* USER CODE END 0 */
 
@@ -98,8 +98,17 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART2_UART_Init();
+
   /* USER CODE BEGIN 2 */
-  
+  // Create logger UART interface
+  Logger_UART_Interface uart_logger(&huart2);
+
+  // Initialize the logger with UART output
+  LOG_INIT(&uart_logger);
+
+  // Simple test logs
+  LOG_INFO("Logger initialized successfully");
+  HAL_Delay(50); // Toggle LED every 50 ms
 
   /* USER CODE END 2 */
 
@@ -110,6 +119,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    // Process the logs to send them via UART
+    LOG_PROCESS();
+
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
     HAL_Delay(500); // Toggle LED every 500 ms
   }
@@ -224,8 +237,8 @@ static void MX_DMA_Init(void)
   Error_Handler();
   }
 
-// Link DMA handle to UART handle
-__HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
+  // Link DMA handle to UART handle
+  __HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
 
   /* DMA interrupt init */
   /* DMA1_Channel7_IRQn interrupt configuration */

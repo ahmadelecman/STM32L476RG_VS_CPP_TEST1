@@ -99,3 +99,33 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     Modules/Logger
     Modules/Logger_UART_Interface
 )
+
+# -------------------------------------------------------------------
+# Log Hash Table Generation (add this block to your CMakeLists.txt)
+# -------------------------------------------------------------------
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+set(LOG_HASH_SCRIPT ${CMAKE_SOURCE_DIR}/extract_log_hashes.py)
+set(LOG_HASH_JSON   ${CMAKE_SOURCE_DIR}/log_hash_table.json)
+
+set(LOG_SOURCE_DIRS
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/Modules
+    #${CMAKE_SOURCE_DIR}/Drivers
+    # Add more directories here as your project grows
+)
+
+add_custom_command(
+    OUTPUT ${LOG_HASH_JSON}
+    COMMAND ${Python3_EXECUTABLE} ${LOG_HASH_SCRIPT} ${LOG_SOURCE_DIRS} ${LOG_HASH_JSON}
+    DEPENDS ${LOG_HASH_SCRIPT}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Extracting log format strings and generating log_hash_table.json"
+)
+
+add_custom_target(generate_log_hash_table ALL DEPENDS ${LOG_HASH_JSON})
+
+add_dependencies(${CMAKE_PROJECT_NAME} generate_log_hash_table)
+
+# ------------------------------------------------------------------
