@@ -1,1 +1,7 @@
-{}
+{
+    "2D4BC428": "Logger initialized successfully",
+    "AE3D3C5A": "Loop tick: %lu",
+    "4966D1BD": "Battery low: %d%%",
+    "371F3A88": "Sensor error: code=%d",
+    "64EA32D8": "Logger stats - Dropped: %lu/%lu, Buffer: %u%%"
+}

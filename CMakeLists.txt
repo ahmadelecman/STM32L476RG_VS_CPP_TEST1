@@ -110,7 +110,7 @@ set(LOG_HASH_SCRIPT ${CMAKE_SOURCE_DIR}/extract_log_hashes.py)
 set(LOG_HASH_JSON   ${CMAKE_SOURCE_DIR}/log_hash_table.json)
 
 set(LOG_SOURCE_DIRS
-    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/Core/src
     ${CMAKE_SOURCE_DIR}/Modules
     #${CMAKE_SOURCE_DIR}/Drivers
     # Add more directories here as your project grows

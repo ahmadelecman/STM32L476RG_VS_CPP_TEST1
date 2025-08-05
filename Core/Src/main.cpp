@@ -110,6 +110,13 @@ int main(void)
   LOG_INFO("Logger initialized successfully");
   HAL_Delay(50); // Toggle LED every 50 ms
 
+  int battery_percent = 75;
+  int error_code = 100;
+  
+  LOG_DEBUG("Loop tick: %lu", HAL_GetTick());
+  LOG_WARN("Battery low: %d%%", battery_percent);
+  LOG_ERROR("Sensor error: code=%d", error_code);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */

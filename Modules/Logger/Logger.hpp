@@ -328,8 +328,8 @@ private:
     template <typename T>
     constexpr uint8_t typeToCode() const {
         using U = std::decay_t<T>;
-        if constexpr (std::is_same_v<U, int32_t>) return 1;
-        else if constexpr (std::is_same_v<U, uint32_t>) return 2;
+        if constexpr (std::is_same_v<U, int32_t> || std::is_same_v<U, int>) return 1;
+        else if constexpr (std::is_same_v<U, uint32_t> || std::is_same_v<U, unsigned int>) return 2;
         else if constexpr (std::is_same_v<U, float>) return 3;
         else if constexpr (std::is_same_v<U, int16_t>) return 4;
         else if constexpr (std::is_same_v<U, uint16_t>) return 5;
